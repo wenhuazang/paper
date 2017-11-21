@@ -18,102 +18,93 @@ import params
 class DANN(object):
     def __init__(self, config):
         self.gpu_fraction = config.fraction
+        self.src_name = config.source_name
+        self.trg_name = config.target_name
         self.is_dan = config.is_dan
         self.learning_rate = config.learning_rate
         self.batch_size = config.batch_size
         self.source_data_dir = config.source_data_dir
         self.target_data_dir = config.target_data_dir
         self.saver_path = config.saver_path
-        self.image_save_dir = config.image_save_dir
         self.max_steps = config.max_steps
         self.decay_steps = config.decay_steps
         self.decay_factor = config.decay_factor
         self.beta = config.beta
         self.alpha = config.alpha
+        self.mode = config.mode
 
-    def dan_s(self, inputs, global_step):
-        with slim.arg_scope([slim.fully_connected],
-                            weights_initializer=tf.truncated_normal_initializer(stddev=0.02), activation_fn=None,
-                            weights_regularizer=slim.l2_regularizer(0.0001)):
-            with slim.arg_scope([slim.batch_norm], decay=0.80, center=True, scale=True, epsilon=1e-5,
-                                activation_fn=tf.nn.relu, is_training=True):
-                p = tf.cast(global_step, tf.float32) / self.max_steps
-                # decay = 0.17 * (2 / (1. + tf.exp(-2.5 * p)) - 1) + 0.1
-                decay = 0.2 * (2 / (1. + tf.exp(-10 * p)) - 1) + 0.2
-                feature = flip_gradient(inputs, decay)
+    def dan_s(self, inputs, labels, reuse=False):
+        with tf.variable_scope('dan_s', reuse=reuse):
+            with slim.arg_scope([slim.fully_connected],
+                                weights_initializer=tf.truncated_normal_initializer(stddev=0.02), activation_fn=None,
+                                weights_regularizer=slim.l2_regularizer(0.0001)):
+                with slim.arg_scope([slim.batch_norm], decay=0.80, center=True, scale=True, epsilon=1e-5,
+                                    activation_fn=tf.nn.relu, is_training=True):
+                    avg = tf.reduce_mean(inputs, axis=0, keep_dims=True)
+                    # avg_1 = tf.reduce_mean(inputs[int(self.batch_size):], axis=0, keep_dims=True)
+                    # avg = tf.concat([avg_0, avg_1], 0)
+                    #
+                    net = slim.fully_connected(avg, params.d_f0, scope="fc0")
+                    net = slim.dropout(net, params.keep_prob)
+                    net = slim.batch_norm(net, scope='bn0')
+                    # [4+2 -> 4]
+                    net = slim.fully_connected(net, params.d_f1, scope="fc1")
+                    net = slim.dropout(net, params.keep_prob)
+                    net = slim.batch_norm(net, scope='bn1')
+                    # [4+2 -> 4]
+                    net = slim.fully_connected(net, params.d_f2, scope="fc2")
+                    net = slim.batch_norm(net, scope='bn2')
+                    # [100]---[1]
+                    logits = slim.fully_connected(net, 1, scope="fc")
 
-                avg_0 = tf.reduce_mean(feature[:int(self.batch_size)], axis=0, keep_dims=True)
-                avg_1 = tf.reduce_mean(feature[int(self.batch_size):], axis=0, keep_dims=True)
-                avg = tf.concat([avg_0, avg_1], 0)
-                # [2500]---[128]
-                net = slim.fully_connected(avg, 128, scope="fc0")
-                net = slim.batch_norm(net, scope='bn0')
-
-                # [128]---[1]
-                logits = slim.fully_connected(net, 1, scope="fc1")
-                source_logits = tf.slice(logits, [0, 0], [1, 1])
-                target_logits = tf.slice(logits, [1, 0], [1, 1])
-                # compute domain_loss
-                s_source_domain_loss = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(
-                        logits=source_logits, labels=tf.ones_like(source_logits)
-                    ))
-                s_target_domain_loss = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(
-                        logits=target_logits, labels=tf.zeros_like(target_logits)
-                    ))
-                s_domain_loss = (s_source_domain_loss + s_target_domain_loss) / 2.0
-                return s_domain_loss
+                    return logits
 
     def dan_s2(self, inputs, global_step):
-        with slim.arg_scope([slim.fully_connected],
-                            weights_initializer=tf.truncated_normal_initializer(stddev=0.02), activation_fn=None,
-                            weights_regularizer=slim.l2_regularizer(0.0001)):
-            with slim.arg_scope([slim.batch_norm], decay=0.80, center=True, scale=True, epsilon=1e-5,
-                                activation_fn=tf.nn.relu, is_training=True):
-                p = tf.cast(global_step, tf.float32) / self.max_steps
-                decay = 0.1 * (2 / (1. + tf.exp(-10 * p)) - 1) + 0.1
-                feature = flip_gradient(inputs, decay)
+        with tf.variable_scope('dan_s2'):
+            with slim.arg_scope([slim.fully_connected],
+                                weights_initializer=tf.truncated_normal_initializer(stddev=0.02), activation_fn=None,
+                                weights_regularizer=slim.l2_regularizer(0.0001)):
+                with slim.arg_scope([slim.batch_norm], decay=0.80, center=True, scale=True, epsilon=1e-5,
+                                    activation_fn=tf.nn.relu, is_training=True):
+                    # avg_0 = tf.reduce_mean(feature[:int(self.batch_size)], axis=0, keep_dims=True)
+                    # avg_1 = tf.reduce_mean(feature[int(self.batch_size):], axis=0, keep_dims=True)
+                    # avg = tf.concat([avg_0, avg_1], 0)
+                    avgs = []
+                    for i in range(4):
+                        avgs.append(tf.reduce_mean(
+                            inputs[int(i * self.batch_size / 2):int((i + 1) * self.batch_size / 2)],
+                            axis=0, keep_dims=True))
+                    avg_00 = tf.abs(avgs[0] - avgs[1])
+                    avg_11 = tf.abs(avgs[2] - avgs[3])
+                    avg_01 = tf.abs(avgs[0] - avgs[2])
+                    avg_10 = tf.abs(avgs[1] - avgs[3])
+                    avg = tf.concat([avg_00, avg_11, avg_01, avg_10], 0)
+                    # [2500]---[128]
+                    net = slim.fully_connected(avg, params.d_f0, scope="fc0")
+                    net = slim.batch_norm(net, scope='bn0')
 
-                # avg_0 = tf.reduce_mean(feature[:int(self.batch_size)], axis=0, keep_dims=True)
-                # avg_1 = tf.reduce_mean(feature[int(self.batch_size):], axis=0, keep_dims=True)
-                # avg = tf.concat([avg_0, avg_1], 0)
-                avgs = []
-                for i in range(4):
-                    avgs.append(tf.reduce_mean(
-                        feature[int(i * self.batch_size / 2):int((i + 1) * self.batch_size / 2)],
-                        axis=0, keep_dims=True))
-                avg_00 = tf.abs(avgs[0] - avgs[1])
-                avg_11 = tf.abs(avgs[2] - avgs[3])
-                avg_01 = tf.abs(avgs[0] - avgs[2])
-                avg_10 = tf.abs(avgs[1] - avgs[3])
-                avg = tf.concat([avg_00, avg_11, avg_01, avg_10], 0)
-                # [2500]---[128]
-                net = slim.fully_connected(avg, 128, scope="fc0")
-                net = slim.batch_norm(net, scope='bn0')
+                    # [128]---[1]
+                    logits = slim.fully_connected(net, 1, scope="fc1")
+                    source_logits = tf.slice(logits, [0, 0], [2, 1])
+                    target_logits = tf.slice(logits, [2, 0], [2, 1])
 
-                # [128]---[1]
-                logits = slim.fully_connected(net, 1, scope="fc1")
-                source_logits = tf.slice(logits, [0, 0], [1, 1])
-                target_logits = tf.slice(logits, [1, 0], [1, 1])
-
-                # compute domain_loss
-                s_source_domain_loss = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(
-                        logits=source_logits, labels=tf.ones_like(source_logits)
-                    ))
-                s_target_domain_loss = tf.reduce_mean(
-                    tf.nn.sigmoid_cross_entropy_with_logits(
-                        logits=target_logits, labels=tf.zeros_like(target_logits)
-                    ))
-                s_domain_loss = (s_source_domain_loss + s_target_domain_loss) / 2.0
-                return s_domain_loss
+                    # compute domain_loss
+                    s_source_domain_loss = tf.reduce_mean(
+                        tf.nn.sigmoid_cross_entropy_with_logits(
+                            logits=source_logits, labels=tf.ones_like(source_logits)
+                        ))
+                    s_target_domain_loss = tf.reduce_mean(
+                        tf.nn.sigmoid_cross_entropy_with_logits(
+                            logits=target_logits, labels=tf.zeros_like(target_logits)
+                        ))
+                    s_domain_loss = (s_source_domain_loss + s_target_domain_loss) / 2.0
+                    return s_domain_loss
 
     def kron(self, f_1, dim_1, f_2, dim_2):
         stack_1 = tf.stack([f_1 for _ in range(dim_1)], axis=2)
-        stack_1 = tf.reshape(stack_1, [2 * self.batch_size, dim_1 * dim_2])
+        stack_1 = tf.reshape(stack_1, [self.batch_size, dim_1 * dim_2])
         stack_2 = tf.stack([f_2 for _ in range(dim_2)], axis=1)
-        stack_2 = tf.reshape(stack_2, [2 * self.batch_size, dim_1 * dim_2])
+        stack_2 = tf.reshape(stack_2, [self.batch_size, dim_1 * dim_2])
         joint_layer_feature = tf.multiply(stack_1, stack_2)
         return joint_layer_feature
 
@@ -121,97 +112,125 @@ class DANN(object):
         with tf.variable_scope("generator", reuse=reuse):
             with slim.arg_scope([slim.conv2d, slim.fully_connected],
                                 weights_initializer=tf.truncated_normal_initializer(stddev=0.02), activation_fn=None,
-                                weights_regularizer=slim.l2_regularizer(0.0001)):
+                                weights_regularizer=slim.l2_regularizer(0.001)):
                 with slim.arg_scope([slim.conv2d], kernel_size=[5, 5], stride=1, padding="SAME"):
                     with slim.arg_scope([slim.max_pool2d], kernel_size=[2, 2], stride=2, padding="SAME"):
                         with slim.arg_scope([slim.batch_norm], decay=0.80, center=True, scale=True, epsilon=1e-5,
                                             activation_fn=tf.nn.relu, is_training=True):
-                            # [28,28,1]---[14,14,64]
-                            net = slim.conv2d(inputs, 32, scope='conv0')
-                            net = slim.max_pool2d(net, scope='pool0')
+                            net = slim.fully_connected(inputs, 500, scope="fc0")
+                            net = slim.dropout(net, params.keep_prob)
                             net = slim.batch_norm(net, scope='bn0')
-                            # [14,14,64]---[7,7,128]
-                            net = slim.conv2d(net, 64, scope='conv1')
-                            net = slim.max_pool2d(net, scope='pool1')
-                            net = slim.batch_norm(net, scope='bn1')
-                            # [7,7,128]---[7,7,128]
-                            net = slim.conv2d(net, 48, scope='conv2')
-                            net = slim.batch_norm(net, scope='bn2')
+                            # [1000]---[100]
+                            # net = slim.fully_connected(net, 10, scope="fc1")
+                            # net = slim.dropout(net, params.keep_prob)
+                            # net = slim.batch_norm(net, scope='bn1')
+                            # net = slim.fully_connected(net, 10, scope="fc2")
+                            # net = slim.dropout(net, params.keep_prob)
+                            # net = slim.batch_norm(net, scope='bn2')
+                            # [100]---[100] no activation function
+                            net = slim.fully_connected(net, params.g_last, scope="fc")
+                            return net
 
-                            # reshape[7,7,128]---[7*7*128]
-                            net = tf.reshape(net, [2 * self.batch_size, 7 * 7 * 48])
-                            # [7*7*128]---[100]
-                            net_layer_1 = slim.fully_connected(net, 100, scope="fc3")
-                            net_layer_1 = slim.batch_norm(net_layer_1, scope='bn3')
-                            # [100]---[10]no activation function
-                            net_layer_2 = slim.fully_connected(net_layer_1, 10, scope="fc4")
-                            multi_layer_feature = self.kron(net_layer_1, 10, net_layer_2, 100)
+    def classifier(self, inputs, reuse=False):
+        with tf.variable_scope("classifier", reuse=reuse):
+            with slim.arg_scope([slim.fully_connected],
+                                weights_initializer=tf.truncated_normal_initializer(stddev=0.02), activation_fn=None,
+                                weights_regularizer=slim.l2_regularizer(0.001)):
+                with slim.arg_scope([slim.batch_norm], decay=0.80, center=True, scale=True, epsilon=1e-5,
+                                    activation_fn=tf.nn.relu, is_training=True):
+                    # source_inputs = tf.slice(inputs, [0, 0], [self.batch_size, params.input_dim])
 
-        return multi_layer_feature, net_layer_2
+                    net = slim.fully_connected(inputs, 2, scope="fc0")
+                    net = slim.batch_norm(net, scope='bn0')
+                    # fc1 [2] --> [2]
+                    logits = slim.fully_connected(net, 2, scope="fc1")
+                    logits = tf.add(inputs, logits)
 
-    def discriminator(self, inputs, reuse=False):
+                    # delta_loss = tf.nn.l2_loss(source_logits)
+                    # loss = tf.nn.l2_loss(source_inputs)
+                    # ratio should be small
+                    # ratio = delta_loss / loss
+
+                return logits
+
+    def discriminator(self, inputs, labels, flag=1, reuse=False):
         with tf.variable_scope("discriminator", reuse=reuse):
             with slim.arg_scope([slim.fully_connected],
                                 weights_initializer=tf.truncated_normal_initializer(stddev=0.02), activation_fn=None,
                                 weights_regularizer=slim.l2_regularizer(0.0001)):
                 with slim.arg_scope([slim.batch_norm], decay=0.80, center=True, scale=True, epsilon=1e-5,
                                     activation_fn=tf.nn.relu, is_training=True):
-                    # [10]---[128]
-                    net = slim.fully_connected(inputs, params.d_f0, scope="fc0")
-                    net = slim.batch_norm(net, scope='bn0')
+                    if flag == 1:
+                        net = slim.fully_connected(inputs, params.d_f0, scope="fc0")
+                        net = slim.dropout(net, params.keep_prob)
+                        net = slim.batch_norm(net, scope='bn0')
+                        # net = slim.fully_connected(net, params.d_f1, scope="fc1")
+                        # net = slim.dropout(net, params.keep_prob)
+                        # net = slim.batch_norm(net, scope='bn1')
+                        # [100]---[1]
+                        logits = slim.fully_connected(net, 1, scope="fc")
+                    else:
+                        # [4+2 -> 4]
+                        net = slim.fully_connected(tf.concat([inputs, labels], axis=1), params.d_f0, scope="fc0")
+                        net = slim.dropout(net, params.keep_prob)
+                        net = slim.batch_norm(net, scope='bn0')
+                        # [4+2 -> 4]
+                        net = slim.fully_connected(tf.concat([net, labels], axis=1), params.d_f1, scope="fc1")
+                        net = slim.dropout(net, params.keep_prob)
+                        net = slim.batch_norm(net, scope='bn1')
+                        # [4+2 -> 4]
+                        net = slim.fully_connected(tf.concat([net, labels], axis=1), params.d_f2, scope="fc2")
+                        net = slim.batch_norm(net, scope='bn2')
+                        # [100]---[1]
+                        logits = slim.fully_connected(net, 1, scope="fc")
+        return logits
 
-                    # [128]---[1]
-                    logits = slim.fully_connected(net, 1, scope="fc1")
-                    d_source_logits = tf.slice(logits, [0, 0], [self.batch_size, 1])
-                    d_target_logits = tf.slice(logits, [self.batch_size, 0], [self.batch_size, 1])
+    def build_model(self, source_images, target_images, source_labels,
+                    target_labels, step, mode, is_gan, is_train=False):
+        if not is_train:
+            target_feature = self.generator(target_images)
+            target_logits = target_feature
+            target_correct = tf.equal(tf.argmax(target_logits, 1), tf.argmax(target_labels, 1))
+            target_acc = tf.reduce_mean(tf.cast(target_correct, tf.float32))
+            return target_acc
+        source_feature = self.generator(source_images)
+        target_feature = self.generator(target_images, reuse=True)
+        source_logits = self.classifier(source_feature)
+        target_logits = target_feature
 
-        return d_source_logits, d_target_logits
+        # Kronecker product of feature and label
+        # @TODO hard label or soft label
+        soft_labels = tf.nn.softmax(target_logits)
+        hard_labels = tf.one_hot(tf.argmax(soft_labels, 1), 2)
+        s_merge_feature = self.kron(source_feature, 2, source_labels, 2)
+        t_merge_feature = self.kron(target_feature, 2, hard_labels, 2)
+        flag = 1
+        d_source_logits = self.discriminator(s_merge_feature, source_labels, flag=flag)
+        d_target_logits = self.discriminator(t_merge_feature, soft_labels, flag=flag, reuse=True)
 
-    def classifier(self, inputs, reuse=False):
+        lr = tf.train.exponential_decay(self.learning_rate, step, self.decay_steps,
+                                        self.decay_factor,
+                                        staircase=True)
 
-        with tf.variable_scope("classifier", reuse=reuse):
-            with slim.arg_scope([slim.fully_connected],
-                                weights_initializer=tf.truncated_normal_initializer(stddev=0.02), activation_fn=None,
-                                weights_regularizer=slim.l2_regularizer(0.0001)):
-                with slim.arg_scope([slim.batch_norm], decay=0.80, center=True, scale=True, epsilon=1e-5,
-                                    activation_fn=tf.nn.relu, is_training=True):
-                    source_inputs = tf.slice(inputs, [0, 0], [self.batch_size, 10])
-                    target_inputs = tf.slice(inputs, [self.batch_size, 0], [self.batch_size, 10])
-                    # fc0
-                    net = slim.fully_connected(source_inputs, 10, scope="fc0")
-                    net = slim.batch_norm(net, scope='bn0')
-                    # fc1
-                    source_logits = slim.fully_connected(net, 10, scope="fc1")
-                    delta_loss = tf.nn.l2_loss(source_logits)
-                    loss = tf.nn.l2_loss(source_inputs)
-                    ratio = delta_loss / loss
-                    source_logits = tf.add(source_inputs, source_logits)
-                    target_logits = target_inputs
-
-        return source_logits, target_logits
-
-    def build_model(self, source_images, target_images, source_labels, target_labels, step, model):
-
-        merged_images = tf.concat([source_images, target_images], 0)
-        multi_feature, single_feature = self.generator(merged_images)
-        source_logits, target_logits = self.classifier(single_feature)
-        # Kronecker product of multi_feature and label
-        # for Unsupervisied domain adaption
-        # merged_labels = tf.concat([source_labels, tf.nn.softmax(target_logits)], 0)
-        # joint_layer_feature = self.kron(single_feature, 10, merged_labels, 10)
-        d_source_logits, d_target_logits = self.discriminator(single_feature)
+        p = tf.cast(step, tf.float32) / self.max_steps
+        decay = params.coeff * (2 / (1. + tf.exp(-2.5 * p)) - 1) + 0.1
         ############
         # compute loss
         ############
-        source_domain_loss = tf.reduce_mean(
-            tf.nn.sigmoid_cross_entropy_with_logits(
-                logits=d_source_logits, labels=tf.ones_like(d_source_logits)
-            ))
-        target_domain_loss = tf.reduce_mean(
-            tf.nn.sigmoid_cross_entropy_with_logits(
-                logits=d_target_logits, labels=tf.zeros_like(d_target_logits)
-            ))
+        s_domain_loss = 0
+        if is_gan == 'dan_s':
+            dan_s_logits = self.dan_s(source_feature, source_labels)
+            dan_t_logits = self.dan_s(target_feature, target_labels, reuse=True)
 
+            s_source_domain_loss = tf.reduce_mean(
+                tf.nn.sigmoid_cross_entropy_with_logits(
+                    logits=dan_s_logits, labels=tf.ones_like(dan_s_logits)
+                ))
+            s_target_domain_loss = tf.reduce_mean(
+                tf.nn.sigmoid_cross_entropy_with_logits(
+                    logits=dan_t_logits, labels=tf.zeros_like(dan_t_logits)
+                ))
+            s_domain_loss = (s_source_domain_loss + s_target_domain_loss) / 2.0
         # source data labeled
         source_label_loss = tf.reduce_mean(
             tf.nn.softmax_cross_entropy_with_logits(
@@ -221,7 +240,6 @@ class DANN(object):
         target_label_loss = tf.reduce_mean(
             tf.nn.softmax_cross_entropy_with_logits(
                 logits=target_logits, labels=tf.nn.softmax(target_logits)))
-
         # source_acc and target acc
         source_correct = tf.equal(tf.argmax(source_logits, 1), tf.argmax(source_labels, 1))
         source_acc = tf.reduce_mean(tf.cast(source_correct, tf.float32))
@@ -229,9 +247,50 @@ class DANN(object):
         target_correct = tf.equal(tf.argmax(target_logits, 1), tf.argmax(target_labels, 1))
         target_acc = tf.reduce_mean(tf.cast(target_correct, tf.float32))
 
-        c_loss = source_label_loss + self.beta * target_label_loss
-        d_loss = source_domain_loss + target_domain_loss
-        # g_loss = -d_loss + c_loss
+        regularization_loss = tf.add_n(tf.losses.get_regularization_losses())
+        c_loss = source_label_loss + self.beta * target_label_loss + regularization_loss
+        clip_disc_weights = None
+        if mode == 'gan':
+            print('########## mode: gan ############')
+            source_domain_loss = tf.reduce_mean(
+                tf.nn.sigmoid_cross_entropy_with_logits(
+                    logits=d_source_logits, labels=tf.ones_like(d_source_logits)
+                ))
+            target_domain_loss = tf.reduce_mean(
+                tf.nn.sigmoid_cross_entropy_with_logits(
+                    logits=d_target_logits, labels=tf.zeros_like(d_target_logits)
+                ))
+            disc_loss = source_domain_loss + target_domain_loss + 0.5 * s_domain_loss
+            d_loss = disc_loss + regularization_loss
+            g_loss = -decay * disc_loss + c_loss
+        elif mode == 'wgan':
+            print('########## mode: wgan ############')
+            # gen_cost = -tf.reduce_mean(disc_fake)
+            disc_cost = tf.reduce_mean(d_target_logits) - tf.reduce_mean(d_source_logits)
+            t_vars = tf.trainable_variables()
+            d_vars = [var for var in t_vars if 'discriminator' in var.name]
+            clip_disc_weights = [v.assign(tf.clip_by_value(v, -0.01, 0.01)) for v in d_vars]
+            d_loss = disc_cost + regularization_loss
+            g_loss = -disc_cost + c_loss + regularization_loss
+
+        # wgan-gp
+        else:
+            print('########## mode: wgan-gp ############')
+            disc_loss = tf.reduce_mean(d_target_logits) - tf.reduce_mean(d_source_logits)
+            alpha = tf.random_uniform(shape=[self.batch_size, 1],
+                                      minval=0., maxval=1., name='alpha')
+            differences = g_target_outputs - g_source_outputs
+            interpolates = g_source_outputs + (alpha * differences)
+            print(tf.shape(interpolates))  # [128, 4]
+            gradients = tf.gradients(self.discriminator(interpolates, 0, flag=1,
+                                                        reuse=True), [interpolates])[0]
+            # reduction_indices = 1, considering batch sample
+            slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), reduction_indices=[1]))
+            gradient_penalty = tf.reduce_mean((slopes - 1.) ** 2)
+            d_loss = disc_loss + params.LAMBDA * gradient_penalty + regularization_loss
+            # d_loss = disc_loss
+            g_loss = -disc_loss + c_loss + regularization_loss
+
         ##################
         # train_op
         ##################
@@ -239,41 +298,47 @@ class DANN(object):
         d_vars = [var for var in t_vars if 'discriminator' in var.name]
         g_vars = [var for var in t_vars if 'generator' in var.name]
         c_vars = [var for var in t_vars if 'classifier' in var.name]
+        dan_vars = [var for var in t_vars if 'dan_s' in var.name]
+        if is_gan == 'dan_s':
+            d_vars += dan_vars
 
-        lr = tf.train.exponential_decay(self.learning_rate, step, self.decay_steps,
-                                        self.decay_factor,
-                                        staircase=True)
+        algorithm = 1
 
-        p = tf.cast(step, tf.float32) / self.max_steps
-        decay = 0.17 * (2 / (1. + tf.exp(-2.5 * p)) - 1) + 0.1
+        if algorithm == 1:
+            d_train_op = tf.train.MomentumOptimizer(lr, 0.9).minimize(d_loss, step, d_vars)
+            g_train_op = tf.train.MomentumOptimizer(lr, 0.9).minimize(g_loss, step, g_vars)
+            c_train_op = tf.train.MomentumOptimizer(lr, 0.9).minimize(c_loss, step, c_vars)
+        elif algorithm == 2:
+            d_train_op = tf.train.AdagradOptimizer(0.001).minimize(d_loss, step, d_vars)
+            g_train_op = tf.train.AdagradOptimizer(0.001).minimize(g_loss, step, g_vars)
+            c_train_op = tf.train.AdagradOptimizer(0.001).minimize(c_loss, step, c_vars)
+        else:
+            d_train_op = tf.train.RMSPropOptimizer(lr).minimize(d_loss, step, d_vars)
+            g_train_op = tf.train.RMSPropOptimizer(lr).minimize(g_loss, step, g_vars)
+            c_train_op = tf.train.RMSPropOptimizer(lr).minimize(c_loss, step, c_vars)
 
-        d_train_op = tf.train.MomentumOptimizer(lr, 0.9).minimize(d_loss, step, d_vars)
-        g_train_op = tf.train.MomentumOptimizer(lr, 0.9).minimize(-decay * d_loss + c_loss, step, g_vars)
-        c_train_op = tf.train.MomentumOptimizer(lr, 0.9).minimize(c_loss, step, [c_vars])
-
-        # train_op = tf.train.AdagradOptimizer(self.learning_rate).minimize(total_loss, step)
         pack_op_loss = [d_train_op, g_train_op, c_train_op, d_loss, c_loss]
-        pack_acc = [source_acc, target_acc, decay]
-
+        # pack_acc = [source_acc, target_acc, decay, lr,
+        #             ratio, clip_disc_weights, gradient_penalty, slopes]
+        pack_acc = [source_acc, target_acc, decay, lr,
+                    0, clip_disc_weights]
         return pack_op_loss, pack_acc
 
     def train_model(self):
         with tf.Graph().as_default():
             global_step = tf.Variable(trainable=False, initial_value=0, dtype=tf.int32)
-            source_images, source_labels = ops.load_batch_mnist(self.batch_size,
-                                                                self.source_data_dir,
-                                                                dataname='train.mnist')
-            target_images, target_labels = ops.load_batch_usps(self.batch_size,
-                                                               self.target_data_dir,
-                                                               dataname='train.usps')
-            # source_images, source_labels = ops.load_batch_mnist(self.batch_size, self.source_data_dir,
-            #                                                     dataname='train.mnist',
-            #                                                     is_RGB=True)
-            # target_images, target_labels = ops.load_batch_mnistm(self.batch_size, self.target_data_dir,
-            #                                                      dataname='train.mnistm')
+            source_images, source_labels = ops.load_batch_amazon_review(batch_size=self.batch_size,
+                                                                        data_dir=self.source_data_dir,
+                                                                        dataname='train.' + self.src_name,
+                                                                        is_train=True)
+            target_images, target_labels = ops.load_batch_amazon_review(batch_size=self.batch_size,
+                                                                        data_dir=self.target_data_dir,
+                                                                        dataname='train.' + self.trg_name,
+                                                                        is_train=True)
             pack_op_loss, pack_acc = self.build_model(source_images, target_images,
                                                       source_labels, target_labels,
-                                                      global_step, self.is_dan)
+                                                      global_step, self.mode,
+                                                      self.is_dan, is_train=True)
 
             d_train_op = pack_op_loss[0]
             g_train_op = pack_op_loss[1]
@@ -285,24 +350,34 @@ class DANN(object):
             source_acc = pack_acc[0]
             target_acc = pack_acc[1]
             decay = pack_acc[2]
+            lr = pack_acc[3]
+            ratio = pack_acc[4]
+            clip_disc_weights = pack_acc[5]
+            # gradient_penalty = pack_acc[6]
+            # slopes = pack_acc[7]
 
             saver = tf.train.Saver(tf.global_variables(), max_to_keep=10000)
 
-            # os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
             config = tf.ConfigProto()
             config.gpu_options.per_process_gpu_memory_fraction = self.gpu_fraction
             sess = tf.Session(config=config)
             # set_session(sess)
-            init = tf.global_variables_initializer()
-            sess.run(init)
+            sess.run(tf.global_variables_initializer())
+            sess.run(tf.local_variables_initializer())
 
             tf.train.start_queue_runners(sess=sess)
             for step in xrange(self.max_steps + 1):
                 start_time = time.time()
+                # print('gradient_penalty: ', sess.run(gradient_penalty))
                 _, _, _ = \
                     sess.run([d_train_op, g_train_op, c_train_op])
+                if clip_disc_weights is not None:
+                    _ = sess.run(clip_disc_weights)
                 duration = time.time() - start_time
                 # assert not np.isnan(t_loss), 'Model diverged with loss = NaN'
+
+                # print('slopes: ', sess.run(tf.shape(slopes)))
                 if step % params.train_show == 0:
                     d_l, c_l = sess.run([d_loss, c_loss])
                     acc_s, acc_t = sess.run([source_acc, target_acc])
@@ -318,6 +393,8 @@ class DANN(object):
                         .format(acc_s, acc_t)
                     print(format_str_1)
                     print('decay:', sess.run(decay))
+                    print('lr:', sess.run(lr))
+                    # print('ratio:', sess.run(ratio))
                     # print(sess.run(self.global_step))
 
                 if step % params.train_save == 0:
@@ -327,35 +404,25 @@ class DANN(object):
     def test_model(self, step):
         with tf.Graph().as_default():
             global_step = tf.Variable(trainable=False, initial_value=0, dtype=tf.int32)
-            # test_source_images, test_source_labels = ops.load_batch_usps(self.batch_size,
-            #                                                              self.source_data_dir,
-            #                                                              dataname='test.usps')
-            # test_target_images, test_target_labels = ops.load_batch_mnist(self.batch_size,
-            #                                                               self.target_data_dir,
-            #                                                               dataname='test.mnist')
-            test_source_images, test_source_labels = ops.load_batch_mnist(self.batch_size,
-                                                                          self.source_data_dir,
-                                                                          dataname='test.mnist')
-            test_target_images, test_target_labels = ops.load_batch_usps(self.batch_size,
-                                                                         self.target_data_dir,
-                                                                         dataname='test.usps')
-            # test_source_images, test_source_labels = ops.load_batch_mnist(self.batch_size,
-            #                                                               self.source_data_dir,
-            #                                                               'test.mnist',
-            #                                                               is_RGB=True)
-            # test_target_images, test_target_labels = ops.load_batch_mnistm(self.batch_size,
-            #                                                                self.target_data_dir,
-            #                                                                'test.mnistm')
 
-            _, pack = self.build_model(test_source_images, test_target_images,
-                                       test_source_labels, test_target_labels,
-                                       global_step, self.is_dan)
+            test_target_images, test_target_labels = ops.load_batch_amazon_review(batch_size=self.batch_size,
+                                                                                  data_dir=self.source_data_dir,
+                                                                                  dataname='test.' + self.trg_name,
+                                                                                  is_train=False)
 
-            target_acc = pack[1]
+            target_acc = self.build_model(None, test_target_images,
+                                          None, test_target_labels,
+                                          global_step, self.mode,
+                                          self.is_dan, is_train=False)
+
             saver = tf.train.Saver(tf.global_variables())
-            sess = tf.Session()
+            config = tf.ConfigProto()
+            config.gpu_options.per_process_gpu_memory_fraction = self.gpu_fraction
+            sess = tf.Session(config=config)
             restore_path = os.path.join(self.saver_path, params.save_model + '-' + str(step))
             print(restore_path)
+            # init local vars
+            sess.run(tf.local_variables_initializer())
             saver.restore(sess, restore_path)
             precision = self.eval_once(sess, target_acc)
 
@@ -367,20 +434,23 @@ class DANN(object):
             threads = []
             for qr in tf.get_collection(tf.GraphKeys.QUEUE_RUNNERS):
                 threads.extend(qr.create_threads(sess, coord=coord, daemon=True, start=True))
-            num_iter = int(math.ceil(10000 / self.batch_size))
             true_count = 0
             step = 0
-            while step < num_iter and not coord.should_stop():
-                predictions = sess.run([accuracy])
-                true_count += np.sum(predictions)
+            while not coord.should_stop():
+                predictions = sess.run(accuracy)
+                true_count += predictions
                 step += 1
-
-            precision = (1.0 * true_count) / num_iter
-            print('precision:', precision)
+            # precision = true_count / step
+            # print('precision:', precision)
         except Exception as e:
+            print ('step: ', step)
+            precision = true_count / step
+            print('precision:', precision)
             coord.request_stop(e)
-
-        coord.request_stop()
-        coord.join(threads, stop_grace_period_secs=1)
-
-        return precision
+            coord.request_stop()
+            coord.join(threads, stop_grace_period_secs=1)
+            return precision
+        # coord.request_stop()
+        # coord.join(threads, stop_grace_period_secs=1)
+        #
+        # return precision
