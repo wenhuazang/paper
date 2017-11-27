@@ -2,23 +2,21 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 import os
-import re
-import sys
 import tensorflow as tf
-import ops_fang
 import ops
 import params
-slim = tf.contrib.slim
-from flip_gradient import flip_gradient
+import tensorflow.contrib.slim as slim
 from datetime import datetime
 import os.path
 import time
-import numpy as np
-import math
 
 
 class DANN(object):
     def __init__(self, config):
+        self.gpu_fraction = config.fraction
+        self.src_name = config.source_name
+        self.trg_name = config.target_name
+        self.is_dan = config.is_dan
         self.learning_rate = config.learning_rate
         self.batch_size = config.batch_size
         self.source_data_dir = config.source_data_dir
@@ -39,7 +37,7 @@ class DANN(object):
         return joint_layer_feature
 
     def generator(self, inputs, reuse=False):
-        with tf.variable_scope("generator", reuse=reuse) as scope:
+        with tf.variable_scope("generator", reuse=reuse):
             with slim.arg_scope([slim.conv2d, slim.fully_connected],
                                 weights_initializer=tf.truncated_normal_initializer(stddev=0.02), activation_fn=None,
                                 weights_regularizer=slim.l2_regularizer(0.0001)):
@@ -76,8 +74,8 @@ class DANN(object):
                                 weights_regularizer=slim.l2_regularizer(0.0001)):
                 with slim.arg_scope([slim.batch_norm], decay=0.80, center=True, scale=True, epsilon=1e-5,
                                     activation_fn=tf.nn.relu, is_training=True):
-                    # [100]---[128]
-                    net = slim.fully_connected(inputs, 128, scope="fc0")
+                    # [100]---[100]
+                    net = slim.fully_connected(inputs, 100, scope="fc0")
                     net = slim.batch_norm(net, scope='bn0')
 
                     # [128]---[1]
@@ -103,43 +101,31 @@ class DANN(object):
 
     def build_model(self, source_images, target_images, source_labels, target_labels, step, is_train=True):
         if not is_train:
-            multi_feature, single_feature = self.generator(target_images)
+            single_feature = self.generator(target_images)
             target_logits = single_feature
             target_correct = tf.equal(tf.argmax(target_logits, 1), tf.argmax(target_labels, 1))
             target_acc = tf.reduce_mean(tf.cast(target_correct, tf.float32))
             return target_acc
-        # @TODO: if seperate generator, acc down!!! So, merge it... maybe the parameter step?
-        # source_feature = self.generator(source_images)
-        # target_feature = self.generator(target_images, reuse=True)
-        # source_logits, ratio = self.classifier(source_feature)
-        # target_logits = target_feature
-
+        # if seperate generator with reuse, acc down!!! So, merge it... maybe the parameter step?
         merged_images = tf.concat([source_images, target_images], 0)
-        single_feature = self.generator(merged_images)
-        source_feature = tf.slice(single_feature, [0, 0], [self.batch_size, 10])
-        target_feature = tf.slice(single_feature, [self.batch_size, 0], [self.batch_size, 10])
-        source_logits = self.classifier(source_feature)
+        merege_features = self.generator(merged_images)
+        source_feature = tf.slice(merege_features, [0, 0], [self.batch_size, 10])
+        # target_feature = tf.slice(merege_features, [self.batch_size, 0], [self.batch_size, 10])
+        # source_logits = self.classifier(source_feature)
+        # target_logits = target_feature
+        c_logits = self.classifier(merege_features)
+        source_logits = tf.slice(c_logits, [0, 0], [self.batch_size, 10])
+        target_logits = tf.slice(c_logits, [self.batch_size, 0], [self.batch_size, 10])
 
-        # ratio: in order to check if f_s approximate f_t. Here ratio is smaller
+        # ratio: in order to check if f_s approximate f_t. Here ratio should be smaller(0.02)
         delta_loss = tf.nn.l2_loss(source_logits)
         loss = tf.nn.l2_loss(source_feature)
         ratio = delta_loss / loss
-
-        target_logits = target_feature
-        '''
-        soft_labels = tf.nn.softmax(target_logits)
-        # hard_labels = tf.one_hot(tf.argmax(soft_labels, 1), 2)
-        s_merge_feature = self.kron(source_feature, params.g_last,
-                                    source_labels, params.g_last)
-        t_merge_feature = self.kron(target_feature, params.g_last,
-                                    soft_labels, params.g_last)
-        # d_source_logits, decay = self.discriminator(s_merge_feature, step)
-        # d_target_logits, decay = self.discriminator(t_merge_feature, step, reuse=True)
-        '''
+        ####################################################
         merged_labels = tf.concat([tf.nn.softmax(source_logits), tf.nn.softmax(target_logits)], 0)
-        Joint_layer_feature = self.kron(single_feature, 10, merged_labels, 10)
+        Joint_layer_feature = self.kron(merege_features, 10, merged_labels, 10)
 
-        d_logits = self.discriminator(Joint_layer_feature, step)
+        d_logits = self.discriminator(Joint_layer_feature)
         d_source_logits = tf.slice(d_logits, [0, 0], [self.batch_size, 1])
         d_target_logits = tf.slice(d_logits, [self.batch_size, 0], [self.batch_size, 1])
 
@@ -177,11 +163,12 @@ class DANN(object):
         lr = tf.train.exponential_decay(self.learning_rate, step, self.decay_steps,
                                         self.decay_factor,
                                         staircase=True)
-        p = tf.cast(step, tf.float32) / 30000
+        p = tf.cast(step, tf.float32) / self.max_steps
         decay = 0.17 * (2 / (1. + tf.exp(-2.5 * p)) - 1) + 0.1
 
-        slim_loss = slim.losses.get_total_loss()
-        d_loss = domain_loss + slim_loss
+        # regularization_loss = slim.losses.get_total_loss()
+        regularization_loss = tf.add_n(tf.losses.get_regularization_losses())
+        d_loss = domain_loss + regularization_loss
         g_loss = -decay*domain_loss + c_loss
         ##################
         # train_op
@@ -202,23 +189,23 @@ class DANN(object):
 
     def train_model(self):
         with tf.Graph().as_default():
-            self.global_step = tf.Variable(trainable=False, initial_value=0, dtype=tf.int32)
-            # self.source_images, self.source_labels = self.load_batch_mnist_train(self.source_data_dir)
-            # self.target_images, self.target_labels = self.load_batch_usps_train(self.target_data_dir)
-
-            self.source_images, self.source_labels = ops.load_batch_mnist(self.batch_size,
-                                                                          self.source_data_dir,
-                                                                          dataname='train.mnist',
-                                                                          is_train=True,
-                                                                          shuffle=False)
-            self.target_images, self.target_labels = ops.load_batch_usps(self.batch_size,
-                                                                         self.target_data_dir,
-                                                                         dataname='train.usps',
-                                                                         is_train=True,
-                                                                         shuffle=False)
-            pack_op_loss, pack_acc = self.build_model(self.source_images, self.target_images,
-                                                               self.source_labels, self.target_labels,
-                                                               self.global_step)
+            global_step = tf.Variable(trainable=False, initial_value=0, dtype=tf.int32)
+            source_images, source_labels = ops.load_batch_mnist(self.batch_size,
+                                                                self.source_data_dir,
+                                                                dataname='train.' + self.src_name,
+                                                                is_train=True)
+            target_images, target_labels = ops.load_batch_usps(self.batch_size,
+                                                               self.target_data_dir,
+                                                               dataname='train.' + self.trg_name,
+                                                               is_train=True)
+            # source_images, source_labels = ops.load_batch_mnist(self.batch_size, self.source_data_dir,
+            #                                                     dataname='train.mnist',
+            #                                                     is_RGB=True)
+            # target_images, target_labels = ops.load_batch_mnistm(self.batch_size, self.target_data_dir,
+            #                                                      dataname='train.mnistm')
+            pack_op_loss, pack_acc = self.build_model(source_images, target_images,
+                                                      source_labels, target_labels,
+                                                      global_step, is_train=True)
 
             d_train_op = pack_op_loss[0]
             g_train_op = pack_op_loss[1]
@@ -235,7 +222,7 @@ class DANN(object):
 
             saver = tf.train.Saver(tf.global_variables(), max_to_keep=10000)
 
-            os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
             config = tf.ConfigProto()
             config.gpu_options.per_process_gpu_memory_fraction = .3
             sess = tf.Session(config=config)
@@ -275,27 +262,29 @@ class DANN(object):
 
     def test_model(self, step):
         with tf.Graph().as_default():
-            self.global_step = tf.Variable(trainable=False, initial_value=0, dtype=tf.int32)
-            self.test_source_images, self.test_source_labels = ops.load_batch_mnist(self.batch_size,
-                                                                                    self.source_data_dir,
-                                                                                    dataname='test.mnist',
-                                                                                    is_train=False)
-            self.test_target_images, self.test_target_labels = ops.load_batch_usps(self.batch_size,
-                                                                                   self.target_data_dir,
-                                                                                   dataname='test.usps',
-                                                                                   is_train=False)
+            global_step = tf.Variable(trainable=False, initial_value=0, dtype=tf.int32)
+            test_target_images, test_target_labels = ops.load_batch_usps(batch_size=2007,
+                                                                         data_dir=self.target_data_dir,
+                                                                         dataname='test.' + self.trg_name,
+                                                                         is_train=False)
+            # test_target_images, test_target_labels = ops.load_batch_mnistm(self.batch_size,
+            #                                                                self.target_data_dir,
+            #                                                                'test.mnistm')
 
-            model_target_acc = self.build_model(self.test_source_images, self.test_target_images,
-                                                        self.test_source_labels, self.test_target_labels,
-                                                        self.global_step, is_train=False)
-            # model_source_acc = pack[0]
-            # model_target_acc = pack[1]
+            target_acc = self.build_model(None, test_target_images,
+                                          None, test_target_labels,
+                                          global_step, is_train=False)
+
             saver = tf.train.Saver(tf.global_variables())
-            sess = tf.Session()
-            restore_path = os.path.join(self.saver_path, 'dann_model-' + str(step))
+            os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+            config = tf.ConfigProto()
+            config.gpu_options.per_process_gpu_memory_fraction = .3
+            sess = tf.Session(config=config)
+            restore_path = os.path.join(self.saver_path, params.save_model + '-' + str(step))
+            print(restore_path)
             sess.run(tf.local_variables_initializer())
             saver.restore(sess, restore_path)
-            precision = self.eval_once(sess, model_target_acc)
+            precision = self.eval_once(sess, target_acc)
 
         return precision
 
@@ -305,15 +294,17 @@ class DANN(object):
             threads = []
             for qr in tf.get_collection(tf.GraphKeys.QUEUE_RUNNERS):
                 threads.extend(qr.create_threads(sess, coord=coord, daemon=True, start=True))
-            true_count = 0
-            step = 0
+            true_count = 0.0
+            num = 0
             while not coord.should_stop():
                 predictions = sess.run(accuracy)
+                # print ('predictions: ', predictions)
                 true_count += predictions
-                step += 1
+                num += 1
         except Exception as e:
-            print('step: ', step)
-            precision = true_count / step
+            print('num: ', num)
+            print('true_count: ', true_count)
+            precision = true_count / num
             print('precision:', precision)
             coord.request_stop(e)
             coord.request_stop()
